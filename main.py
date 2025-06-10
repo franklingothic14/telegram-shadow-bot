@@ -48,6 +48,22 @@ def get_nearby_buildings(lat, lon, radius=50):
     data = response.json()
     return data.get('elements', [])
 
+def get_building_height(tags):
+    if 'height' in tags:
+        try:
+            h_str = tags['height'].replace('m', '').strip()
+            height = float(h_str)
+            return height
+        except:
+            pass
+    if 'building:levels' in tags:
+        try:
+            levels = int(tags['building:levels'])
+            return levels * 3
+        except:
+            pass
+    return 10  # За замовчуванням 10 метрів
+
 def get_sun_position(lat, lon, date_time):
     observer = Observer(latitude=lat, longitude=lon, elevation=0)
     azimuth = astral_sun.azimuth(observer, date_time)
@@ -117,17 +133,7 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
                     continue
 
                 tags = b.get('tags', {})
-                height = 10
-                if 'height' in tags:
-                    try:
-                        height = float(tags['height'].replace('m','').strip())
-                    except:
-                        height = 10
-                elif 'building:levels' in tags:
-                    try:
-                        height = float(tags['building:levels']) * 3
-                    except:
-                        height = 10
+                height = get_building_height(tags)
 
                 shadow_length = calculate_shadow_length(height, altitude)
                 if shadow_length is None:
@@ -185,7 +191,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     lat, lon = loc.latitude, loc.longitude
 
-    # Опціональна перевірка погоди
     if USE_WEATHER:
         weather = get_weather(lat, lon)
         if weather is None:
@@ -202,7 +207,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    # Звіт про будівлі
     count_buildings = len(buildings)
     count_with_height = 0
     count_with_levels = 0
@@ -221,7 +225,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_text = "\n".join(report_lines)
     await update.message.reply_text(report_text)
 
-    # Перевірка, чи машина під будівлею (відстань < 3м)
     for b in buildings:
         b_lat = None
         b_lon = None
