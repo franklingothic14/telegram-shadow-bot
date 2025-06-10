@@ -9,22 +9,26 @@ from astral.sun import sun
 from astral import sun as astral_sun
 from astral import Observer
 
+# Отримання ключів API та налаштувань з оточення
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+USE_WEATHER = os.getenv('USE_WEATHER', 'false').lower() == 'true'
 
+# Функція для отримання погоди
 def get_weather(lat, lon):
+    if not OPENWEATHER_API_KEY:
+        return None
     url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ua"
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
-        weather_id = data['weather'][0]['id']
         description = data['weather'][0]['description']
         clouds = data.get('clouds', {}).get('all', 0)
         rain = data.get('rain', {})
         snow = data.get('snow', {})
-        # Визначимо, чи є опади або сильна хмарність
         precip = rain.get('1h', 0) + snow.get('1h', 0)
         is_rain = precip > 0
-        is_cloudy = clouds > 70  # понад 70% хмарності вважаємо сильною хмарністю
+        is_cloudy = clouds > 70
         return {
             'description': description,
             'is_rain': is_rain,
@@ -33,6 +37,7 @@ def get_weather(lat, lon):
     except Exception:
         return None
 
+# Функція для отримання будівель поблизу з OpenStreetMap
 def get_nearby_buildings(lat, lon, radius=50):
     query = f"""
     [out:json];
@@ -46,18 +51,21 @@ def get_nearby_buildings(lat, lon, radius=50):
     data = response.json()
     return data.get('elements', [])
 
+# Функція для обчислення положення сонця
 def get_sun_position(lat, lon, date_time):
     observer = Observer(latitude=lat, longitude=lon, elevation=0)
     azimuth = astral_sun.azimuth(observer, date_time)
     altitude = astral_sun.elevation(observer, date_time)
     return azimuth, altitude
 
+# Функція для обчислення довжини тіні
 def calculate_shadow_length(height, sun_altitude_deg):
     if sun_altitude_deg <= 0:
         return None
     sun_altitude_rad = math.radians(sun_altitude_deg)
     return height / math.tan(sun_altitude_rad)
 
+# Функція для обчислення азимуту між двома точками
 def calculate_azimuth(lat1, lon1, lat2, lon2):
     lat1_rad = math.radians(lat1)
     lat2_rad = math.radians(lat2)
@@ -68,6 +76,7 @@ def calculate_azimuth(lat1, lon1, lat2, lon2):
     azimuth_deg = (math.degrees(azimuth_rad) + 360) % 360
     return azimuth_deg
 
+# Функція для обчислення відстані між двома точками
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1 = math.radians(lat1)
@@ -78,6 +87,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2*math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+# Функція для перевірки, чи точка в тіні
 def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, shadow_length, shadow_direction):
     azimuth_to_car = calculate_azimuth(building_center_lat, building_center_lon, car_lat, car_lon)
     dist = haversine_distance(building_center_lat, building_center_lon, car_lat, car_lon)
@@ -86,6 +96,7 @@ def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, 
         return True
     return False
 
+# Обробник команди /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[KeyboardButton('Запаркувався - скинути локацію', request_location=True)]]
     await update.message.reply_text(
@@ -93,21 +104,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
     )
 
+# Обробник отриманої локації
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     lat, lon = loc.latitude, loc.longitude
 
-    # Перевірка погоди
-    weather = get_weather(lat, lon)
-    if weather is None:
-        await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
-        return
-    if weather['is_rain']:
-        await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
-        return
-    if weather['is_cloudy']:
-        await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
-        # Можна продовжити перевірку, але попередити користувача
+    # Перевірка погоди, якщо увімкнено
+    if USE_WEATHER:
+        weather = get_weather(lat, lon)
+        if weather is None:
+            await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
+            return
+        if weather['is_rain']:
+            await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
+            return
+        if weather['is_cloudy']:
+            await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
 
     now = datetime.now(timezone.utc)
     sun_azimuth, sun_altitude = get_sun_position(lat, lon, now)
@@ -121,7 +133,7 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    # Перевірка, чи локація співпадає з будівлею (машина "під" будівлею)
+    # Перевірка, чи локація співпадає з будівлею
     for b in buildings:
         b_lat = None
         b_lon = None
@@ -137,17 +149,18 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         dist = haversine_distance(lat, lon, b_lat, b_lon)
-        # Якщо відстань дуже мала (наприклад, <3 м), вважаємо, що машина під будівлею — в тіні
         if dist < 3:
             await update.message.reply_text(
                 f"Ваша машина знаходиться безпосередньо під будівлею (ID: {b.get('id', 'невідомо')}) — вона в тіні."
             )
             return
 
-    # Якщо не під будівлею, перевіряємо тінь від будівель
+    # Перевірка наявності тіні від будівель
     in_shadow = False
     shadow_building_id = None
     for b in buildings:
+        b_lat = None
+        b_lon = None
         if 'center' in b:
             b_lat = b['center']['lat']
             b_lon = b['center']['lon']
@@ -202,15 +215,11 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 if __name__ == '__main__':
-    token = os.getenv('BOT_TOKEN')
-    if not token:
+    if not BOT_TOKEN:
         print("Помилка: не задано BOT_TOKEN")
         exit(1)
-    if not OPENWEATHER_API_KEY:
-        print("Помилка: не задано OPENWEATHER_API_KEY")
-        exit(1)
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     print("Бот запущено...")
