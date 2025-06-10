@@ -3,7 +3,10 @@ import math
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 from astral import Observer
 from astral.sun import azimuth as sun_azimuth_func, elevation as sun_elevation_func
 
@@ -22,6 +25,13 @@ ORIENTATION_DEGREES = {
 cache_overpass = {}
 cache_weather = {}
 CACHE_TTL = timedelta(minutes=10)
+
+def get_main_keyboard():
+    kb = [
+        [KeyboardButton("Скинути розташування", request_location=True)],
+        [KeyboardButton("Скинути скріншот з локацією")]
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
 async def fetch_overpass(lat, lon, radius=50):
     key = (round(lat, 4), round(lon, 4), radius)
@@ -210,14 +220,12 @@ def format_schedule_text_with_sides(schedule):
 
     lines = []
 
-    # Тінь — виводимо один інтервал від мінімального початку до максимального кінця
     if shade_periods:
         shade_start = min(p[0] for p in shade_periods)
         shade_end = max(p[1] for p in shade_periods)
         shade_minutes = int(sum((e - s).total_seconds() for s, e in shade_periods) // 60)
         lines.append(f"Ваша машина буде в тіні {shade_minutes} хв з {shade_start.astimezone().strftime('%H:%M')} до {shade_end.astimezone().strftime('%H:%M')}\n")
 
-    # Сонце — деталізовано по частинах машини
     for side, intervals in sun_parts.items():
         if not intervals:
             continue
@@ -230,36 +238,64 @@ def format_schedule_text_with_sides(schedule):
     return "\n".join(lines).strip()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[KeyboardButton('Запаркувався - скинути локацію', request_location=True)]]
     await update.message.reply_text(
-        'Натисни кнопку, щоб надіслати свою локацію:',
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+        "Виберіть дію:",
+        reply_markup=get_main_keyboard()
     )
 
-async def ask_car_orientation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [KeyboardButton("Північ"), KeyboardButton("Схід")],
-        [KeyboardButton("Південь"), KeyboardButton("Захід")],
-        [KeyboardButton("Не знаю")]
-    ]
-    await update.message.reply_text(
-        "Вкажіть, в який бік орієнтована передня частина вашої машини або оберіть «Не знаю»:",
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
-    )
-
-async def orientation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text not in ORIENTATION_DEGREES:
-        await update.message.reply_text("Будь ласка, оберіть напрямок із кнопок.")
+async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    if not loc:
+        await update.message.reply_text("Будь ласка, надішліть локацію.")
         return
-    orientation = ORIENTATION_DEGREES[text]
-    context.user_data['car_orientation'] = orientation
-    await update.message.reply_text(f"Орієнтація машини встановлена: {text}. Обробляю дані...")
+    context.user_data['location'] = loc
+    await update.message.reply_text("Локація отримана. Тепер можете надіслати скріншот або продовжити аналіз.")
 
-    if orientation is None:
-        await analyze_and_report_shadow_simple(update, context)
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_file = await update.message.photo[-1].get_file()
+    file_path = f"./photos/{photo_file.file_id}.jpg"
+    await photo_file.download_to_drive(file_path)
+
+    loc = context.user_data.get('location')
+    if not loc:
+        await update.message.reply_text("Щоб додати скріншот будівлі, спочатку надішліть локацію.")
+        return
+
+    fake_building = {
+        'id': f'screenshot_{photo_file.file_id}',
+        'center': {
+            'lat': loc.latitude,
+            'lon': loc.longitude
+        },
+        'tags': {'height': '15'}
+    }
+    if 'extra_buildings' not in context.user_data:
+        context.user_data['extra_buildings'] = []
+    context.user_data['extra_buildings'].append(fake_building)
+    await update.message.reply_text("Скріншот отримано і додано для аналізу з висотою 15 м.")
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Скинути розташування":
+        await update.message.reply_text(
+            "Натисніть кнопку нижче, щоб надіслати локацію:",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("Надіслати локацію", request_location=True)]],
+                resize_keyboard=True, one_time_keyboard=True
+            )
+        )
+    elif text == "Скинути скріншот з локацією":
+        await update.message.reply_text("Будь ласка, надішліть фото будівель або місцевості з вашою локацією.")
+    elif text in ORIENTATION_DEGREES:
+        orientation = ORIENTATION_DEGREES[text]
+        context.user_data['car_orientation'] = orientation
+        await update.message.reply_text(f"Орієнтація машини встановлена: {text}. Обробляю дані...")
+        if orientation is None:
+            await analyze_and_report_shadow_simple(update, context)
+        else:
+            await analyze_and_report_shadow(update, context)
     else:
-        await analyze_and_report_shadow(update, context)
+        await update.message.reply_text("Будь ласка, оберіть одну з кнопок меню.")
 
 async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = context.user_data.get('location') or update.message.location
@@ -278,14 +314,14 @@ async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes
             await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
 
     buildings = await fetch_overpass(lat, lon, radius=50)
-    if not buildings:
-        await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
-        return
+    extra = context.user_data.get('extra_buildings', [])
+    extra_filtered = [b for b in extra if b['center']['lat'] is not None and b['center']['lon'] is not None]
+    all_buildings = buildings + extra_filtered
 
-    count_buildings = len(buildings)
+    count_buildings = len(all_buildings)
     count_with_height = 0
     count_with_levels = 0
-    for b in buildings:
+    for b in all_buildings:
         tags = b.get('tags', {})
         if 'height' in tags:
             count_with_height += 1
@@ -299,8 +335,7 @@ async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes
     ]
     await update.message.reply_text("\n".join(report_lines))
 
-    # Перевірка, чи машина під будівлею (відстань < 3м)
-    for b in buildings:
+    for b in all_buildings:
         b_lat = None
         b_lon = None
         if 'center' in b:
@@ -321,7 +356,7 @@ async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes
             )
             return
 
-    schedule = await analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
+    schedule = await analyze_shadow_schedule(lat, lon, all_buildings, interval_minutes=15)
     text = format_schedule_text_with_sides(schedule)
     await update.message.reply_text(text)
 
@@ -346,14 +381,14 @@ async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
 
     buildings = await fetch_overpass(lat, lon, radius=50)
-    if not buildings:
-        await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
-        return
+    extra = context.user_data.get('extra_buildings', [])
+    extra_filtered = [b for b in extra if b['center']['lat'] is not None and b['center']['lon'] is not None]
+    all_buildings = buildings + extra_filtered
 
-    count_buildings = len(buildings)
+    count_buildings = len(all_buildings)
     count_with_height = 0
     count_with_levels = 0
-    for b in buildings:
+    for b in all_buildings:
         tags = b.get('tags', {})
         if 'height' in tags:
             count_with_height += 1
@@ -367,8 +402,7 @@ async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAUL
     ]
     await update.message.reply_text("\n".join(report_lines))
 
-    # Перевірка, чи машина під будівлею (відстань < 3м)
-    for b in buildings:
+    for b in all_buildings:
         b_lat = None
         b_lon = None
         if 'center' in b:
@@ -389,27 +423,22 @@ async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
-    schedule = await analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15)
+    schedule = await analyze_shadow_schedule_detailed(lat, lon, all_buildings, car_orientation, interval_minutes=15)
     text = format_schedule_text_with_sides(schedule)
     await update.message.reply_text(text)
 
-async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.location is None:
-        await update.message.reply_text("Будь ласка, надішліть локацію.")
-        return
-    context.user_data['location'] = update.message.location
-    await ask_car_orientation(update, context)
-
-def main():
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), orientation_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     print("Бот запущено...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == '__main__':
     if not BOT_TOKEN:
         print("Помилка: не задано BOT_TOKEN")
         exit(1)
-    main()
+    import asyncio
+    asyncio.run(main())
