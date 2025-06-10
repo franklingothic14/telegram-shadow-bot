@@ -202,6 +202,25 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
+    # Звіт про будівлі
+    count_buildings = len(buildings)
+    count_with_height = 0
+    count_with_levels = 0
+    for b in buildings:
+        tags = b.get('tags', {})
+        if 'height' in tags:
+            count_with_height += 1
+        if 'building:levels' in tags:
+            count_with_levels += 1
+
+    report_lines = [
+        f"Знайдено будівель поблизу: {count_buildings}",
+        f"З них з вказаною висотою: {count_with_height}",
+        f"З них з вказаною кількістю поверхів: {count_with_levels}"
+    ]
+    report_text = "\n".join(report_lines)
+    await update.message.reply_text(report_text)
+
     # Перевірка, чи машина під будівлею (відстань < 3м)
     for b in buildings:
         b_lat = None
