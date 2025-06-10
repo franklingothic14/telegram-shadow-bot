@@ -11,17 +11,11 @@ from astral import Observer
 from astral.sun import azimuth as sun_azimuth_func, elevation as sun_elevation_func
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
-USE_WEATHER = os.getenv('USE_WEATHER', 'false').lower() == 'true'
-
-cache_overpass = {}
-cache_weather = {}
 CACHE_TTL = timedelta(minutes=10)
+cache_overpass = {}
 
 def get_main_keyboard():
-    kb = [
-        [KeyboardButton("Скинути розташування", request_location=True)]
-    ]
+    kb = [[KeyboardButton("Надіслати локацію", request_location=True)]]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
 async def fetch_overpass(lat, lon, radius=50):
@@ -47,50 +41,16 @@ async def fetch_overpass(lat, lon, radius=50):
             cache_overpass[key] = (now, data.get('elements', []))
             return cache_overpass[key][1]
 
-async def fetch_weather(lat, lon):
-    if not OPENWEATHER_API_KEY:
-        return None
-    key = (round(lat, 4), round(lon, 4))
-    now = datetime.now(timezone.utc)
-    if key in cache_weather:
-        cached_time, data = cache_weather[key]
-        if now - cached_time < CACHE_TTL:
-            return data
-
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ua"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, timeout=5) as resp:
-                data = await resp.json()
-                description = data['weather'][0]['description']
-                clouds = data.get('clouds', {}).get('all', 0)
-                rain = data.get('rain', {})
-                snow = data.get('snow', {})
-                precip = rain.get('1h', 0) + snow.get('1h', 0)
-                is_rain = precip > 0
-                is_cloudy = clouds > 70
-                result = {
-                    'description': description,
-                    'is_rain': is_rain,
-                    'is_cloudy': is_cloudy
-                }
-                cache_weather[key] = (now, result)
-                return result
-        except Exception:
-            return None
-
 def get_building_height(tags):
     if 'height' in tags:
         try:
             h_str = tags['height'].replace('m', '').strip()
-            height = float(h_str)
-            return height
+            return float(h_str)
         except:
             pass
     if 'building:levels' in tags:
         try:
-            levels = int(tags['building:levels'])
-            return levels * 3
+            return int(tags['building:levels']) * 3
         except:
             pass
     return 15  # За замовчуванням 15 метрів
@@ -114,11 +74,10 @@ def calculate_azimuth(lat1, lon1, lat2, lon2):
     x = math.sin(d_lon) * math.cos(lat2_rad)
     y = math.cos(lat1_rad)*math.sin(lat2_rad) - math.sin(lat1_rad)*math.cos(lat2_rad)*math.cos(d_lon)
     azimuth_rad = math.atan2(x, y)
-    azimuth_deg = (math.degrees(azimuth_rad) + 360) % 360
-    return azimuth_deg
+    return (math.degrees(azimuth_rad) + 360) % 360
 
 def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371000
+    R = 6371000  # радіус Землі в метрах
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
@@ -127,9 +86,9 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2*math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, shadow_length, shadow_direction):
-    azimuth_to_car = calculate_azimuth(building_center_lat, building_center_lon, car_lat, car_lon)
-    dist = haversine_distance(building_center_lat, building_center_lon, car_lat, car_lon)
+def point_in_shadow(b_lat, b_lon, car_lat, car_lon, shadow_length, shadow_direction):
+    azimuth_to_car = calculate_azimuth(b_lat, b_lon, car_lat, car_lon)
+    dist = haversine_distance(b_lat, b_lon, car_lat, car_lon)
     angle_diff = min(abs(azimuth_to_car - shadow_direction), 360 - abs(azimuth_to_car - shadow_direction))
     return dist <= shadow_length and angle_diff <= 30
 
@@ -169,6 +128,7 @@ async def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
                 if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
                     in_shadow = True
                     break
+
             state = 'тінь від будівель' if in_shadow else 'сонце'
 
         if current_state is None:
@@ -184,7 +144,7 @@ async def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     schedule.append((state_start, time, current_state))
     return schedule
 
-def format_schedule_text(schedule):
+def format_schedule_text_with_sun_slots(schedule):
     sun_periods = [p for p in schedule if p[2] == 'сонце']
     shade_periods = [p for p in schedule if p[2].startswith('тінь')]
 
@@ -193,8 +153,16 @@ def format_schedule_text(schedule):
 
     lines = [
         f"Ваша машина буде під сонцем: {total_sun} хв",
-        f"Ваша машина буде в тіні: {total_shade} хв"
+        "Часові слоти під сонцем:"
     ]
+
+    for start, end, _ in sun_periods:
+        lines.append(f"  з {start.astimezone().strftime('%H:%M')} до {end.astimezone().strftime('%H:%M')}")
+
+    if shade_periods:
+        shade_start = min(p[0] for p in shade_periods)
+        shade_end = max(p[1] for p in shade_periods)
+        lines.append(f"\nВаша машина буде в тіні: {total_shade} хв з {shade_start.astimezone().strftime('%H:%M')} до {shade_end.astimezone().strftime('%H:%M')}")
 
     return "\n".join(lines)
 
@@ -212,41 +180,13 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lat = loc.latitude
     lon = loc.longitude
 
-    if USE_WEATHER:
-        weather = await fetch_weather(lat, lon)
-        if weather is None:
-            await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
-            return
-        if weather['is_rain']:
-            await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
-            return
-        if weather['is_cloudy']:
-            await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
-
     buildings = await fetch_overpass(lat, lon, radius=50)
     if not buildings:
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    count_buildings = len(buildings)
-    count_with_height = 0
-    count_with_levels = 0
-    for b in buildings:
-        tags = b.get('tags', {})
-        if 'height' in tags:
-            count_with_height += 1
-        if 'building:levels' in tags:
-            count_with_levels += 1
-
-    report_lines = [
-        f"Знайдено будівель поблизу: {count_buildings}",
-        f"З них з вказаною висотою: {count_with_height}",
-        f"З них з вказаною кількістю поверхів: {count_with_levels}"
-    ]
-    await update.message.reply_text("\n".join(report_lines))
-
     schedule = await analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
-    text = format_schedule_text(schedule)
+    text = format_schedule_text_with_sun_slots(schedule)
     await update.message.reply_text(text)
 
 def main():
