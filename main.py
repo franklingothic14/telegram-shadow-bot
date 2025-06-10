@@ -1,48 +1,39 @@
-from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, MessageHandler, Filters
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Location
+from aiogram.utils import executor
 from suntime import Sun
-from datetime import datetime, timedelta
-import pytz
+from datetime import datetime
 import os
 
-TOKEN = os.getenv('BOT_TOKEN')
-bot = Bot(token=TOKEN)
-app = Flask(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-def check_shadow(lat, lon):
-    sun = Sun(lat, lon)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+@dp.message_handler(commands=['start'])
+async def start_cmd(message: types.Message):
+    await message.reply("👋 Надішли свою геолокацію, де запаркувався.")
+
+@dp.message_handler(content_types=['location'])
+async def handle_location(message: types.Message):
+    loc: Location = message.location
+    sun = Sun(loc.latitude, loc.longitude)
     now = datetime.utcnow()
+
     try:
-        elevation = sun.get_solar_elevation(now)
-        if elevation < 35:
-            return f"🌳 Є тінь зараз (висота сонця: {int(elevation)}°)"
+        sr = sun.get_sunrise_time()
+        ss = sun.get_sunset_time()
+
+        if now < sr:
+            diff = sr - now
+            await message.reply(f"Зараз темно 🌙. Сонце зійде через {diff.seconds//60} хв.")
+        elif now > ss:
+            await message.reply("Сонце вже сіло 🌙. Місце в тіні.")
         else:
-            for i in range(1, 240):
-                t = now + timedelta(minutes=i)
-                if sun.get_solar_elevation(t) < 35:
-                    return f"☀️ Зараз на сонці. Тінь буде через {i} хв."
-            return "☀️ Зараз на сонці. Тінь з'явиться пізніше сьогодні."
+            await message.reply("Сонце над горизонтом ☀️. Можливо, ще немає тіні.")
     except Exception as e:
-        return "Помилка розрахунку тіні."
-
-def handle_location(update, context):
-    loc = update.message.location
-    lat, lon = loc.latitude, loc.longitude
-    msg = check_shadow(lat, lon)
-    update.message.reply_text(msg)
-
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dp = Dispatcher(bot, None, workers=0)
-    dp.add_handler(MessageHandler(Filters.location, handle_location))
-    dp.process_update(update)
-    return 'ok'
-
-@app.route('/')
-def home():
-    return 'Bot is running!'
+        await message.reply("Помилка при розрахунках.")
 
 if __name__ == '__main__':
-    app.run()
+    executor.start_polling(dp)

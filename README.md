@@ -1,3 +1,3 @@
-# Telegram Shadow Bot
+# ShadowBot
 
-Send your location and the bot will tell if you are in shadow or not.
+Telegram-бот, який повідомляє, чи є тінь на місці парковки.
