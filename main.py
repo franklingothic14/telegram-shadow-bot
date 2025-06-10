@@ -1,7 +1,7 @@
 import os
 import math
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from astral import LocationInfo
@@ -9,12 +9,10 @@ from astral.sun import sun
 from astral import sun as astral_sun
 from astral import Observer
 
-# Отримання ключів API та налаштувань з оточення
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 USE_WEATHER = os.getenv('USE_WEATHER', 'false').lower() == 'true'
 
-# Функція для отримання погоди
 def get_weather(lat, lon):
     if not OPENWEATHER_API_KEY:
         return None
@@ -37,7 +35,6 @@ def get_weather(lat, lon):
     except Exception:
         return None
 
-# Функція для отримання будівель поблизу з OpenStreetMap
 def get_nearby_buildings(lat, lon, radius=50):
     query = f"""
     [out:json];
@@ -51,21 +48,18 @@ def get_nearby_buildings(lat, lon, radius=50):
     data = response.json()
     return data.get('elements', [])
 
-# Функція для обчислення положення сонця
 def get_sun_position(lat, lon, date_time):
     observer = Observer(latitude=lat, longitude=lon, elevation=0)
     azimuth = astral_sun.azimuth(observer, date_time)
     altitude = astral_sun.elevation(observer, date_time)
     return azimuth, altitude
 
-# Функція для обчислення довжини тіні
 def calculate_shadow_length(height, sun_altitude_deg):
     if sun_altitude_deg <= 0:
         return None
     sun_altitude_rad = math.radians(sun_altitude_deg)
     return height / math.tan(sun_altitude_rad)
 
-# Функція для обчислення азимуту між двома точками
 def calculate_azimuth(lat1, lon1, lat2, lon2):
     lat1_rad = math.radians(lat1)
     lat2_rad = math.radians(lat2)
@@ -76,7 +70,6 @@ def calculate_azimuth(lat1, lon1, lat2, lon2):
     azimuth_deg = (math.degrees(azimuth_rad) + 360) % 360
     return azimuth_deg
 
-# Функція для обчислення відстані між двома точками
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1 = math.radians(lat1)
@@ -87,7 +80,6 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2*math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-# Функція для перевірки, чи точка в тіні
 def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, shadow_length, shadow_direction):
     azimuth_to_car = calculate_azimuth(building_center_lat, building_center_lon, car_lat, car_lon)
     dist = haversine_distance(building_center_lat, building_center_lon, car_lat, car_lon)
@@ -96,7 +88,92 @@ def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, 
         return True
     return False
 
-# Обробник команди /start
+def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
+    now = datetime.now(timezone.utc)
+    end_time = now + timedelta(hours=24)
+
+    schedule = []
+    current_state = None
+    state_start = now
+    time = now
+
+    while time <= end_time:
+        azimuth, altitude = get_sun_position(lat, lon, time)
+        if altitude <= 0:
+            state = 'shade'  # ніч, тінь
+        else:
+            shadow_direction = (azimuth + 180) % 360
+            in_shadow = False
+            for b in buildings:
+                if 'center' in b:
+                    b_lat = b['center']['lat']
+                    b_lon = b['center']['lon']
+                elif 'geometry' in b and len(b['geometry']) > 0:
+                    lats = [p['lat'] for p in b['geometry']]
+                    lons = [p['lon'] for p in b['geometry']]
+                    b_lat = sum(lats)/len(lats)
+                    b_lon = sum(lons)/len(lons)
+                else:
+                    continue
+
+                tags = b.get('tags', {})
+                height = 10
+                if 'height' in tags:
+                    try:
+                        height = float(tags['height'].replace('m','').strip())
+                    except:
+                        height = 10
+                elif 'building:levels' in tags:
+                    try:
+                        height = float(tags['building:levels']) * 3
+                    except:
+                        height = 10
+
+                shadow_length = calculate_shadow_length(height, altitude)
+                if shadow_length is None:
+                    continue
+
+                if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
+                    in_shadow = True
+                    break
+
+            state = 'shade' if in_shadow else 'sun'
+
+        if current_state is None:
+            current_state = state
+            state_start = time
+        elif state != current_state:
+            schedule.append((state_start, time, current_state))
+            current_state = state
+            state_start = time
+
+        time += timedelta(minutes=interval_minutes)
+
+    schedule.append((state_start, time, current_state))
+    return schedule
+
+def format_schedule_text(schedule):
+    shade_periods = [p for p in schedule if p[2] == 'shade']
+    sun_periods = [p for p in schedule if p[2] == 'sun']
+
+    total_shade = sum((p[1] - p[0]).total_seconds() for p in shade_periods) / 60
+    total_sun = sum((p[1] - p[0]).total_seconds() for p in sun_periods) / 60
+
+    def period_str(p):
+        start_str = p[0].astimezone().strftime('%H:%M')
+        end_str = p[1].astimezone().strftime('%H:%M')
+        duration_min = int((p[1] - p[0]).total_seconds() // 60)
+        return f"{duration_min}хв з {start_str} до {end_str}"
+
+    shade_texts = [period_str(p) for p in shade_periods]
+    sun_texts = [period_str(p) for p in sun_periods]
+
+    text = (f"Ваша машина буде в тіні {int(total_shade)} хв:\n" +
+            "\n".join(shade_texts) + "\n\n" +
+            f"Під сонцем буде {int(total_sun)} хв:\n" +
+            "\n".join(sun_texts))
+    return text
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[KeyboardButton('Запаркувався - скинути локацію', request_location=True)]]
     await update.message.reply_text(
@@ -104,12 +181,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
     )
 
-# Обробник отриманої локації
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     lat, lon = loc.latitude, loc.longitude
 
-    # Перевірка погоди, якщо увімкнено
+    # Опціональна перевірка погоди
     if USE_WEATHER:
         weather = get_weather(lat, lon)
         if weather is None:
@@ -121,19 +197,12 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if weather['is_cloudy']:
             await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
 
-    now = datetime.now(timezone.utc)
-    sun_azimuth, sun_altitude = get_sun_position(lat, lon, now)
-
-    if sun_altitude <= 0:
-        await update.message.reply_text("Сонце зараз під горизонтом, тіні від сонця немає.")
-        return
-
     buildings = get_nearby_buildings(lat, lon, radius=50)
     if not buildings:
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    # Перевірка, чи локація співпадає з будівлею
+    # Перевірка, чи машина під будівлею (відстань < 3м)
     for b in buildings:
         b_lat = None
         b_lon = None
@@ -155,64 +224,9 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Перевірка наявності тіні від будівель
-    in_shadow = False
-    shadow_building_id = None
-    for b in buildings:
-        b_lat = None
-        b_lon = None
-        if 'center' in b:
-            b_lat = b['center']['lat']
-            b_lon = b['center']['lon']
-        elif 'geometry' in b and len(b['geometry']) > 0:
-            lats = [p['lat'] for p in b['geometry']]
-            lons = [p['lon'] for p in b['geometry']]
-            b_lat = sum(lats)/len(lats)
-            b_lon = sum(lons)/len(lons)
-        else:
-            continue
-
-        tags = b.get('tags', {})
-        height = None
-        if 'height' in tags:
-            try:
-                height = float(tags['height'].replace('m','').strip())
-            except:
-                height = 10
-        elif 'building:levels' in tags:
-            try:
-                height = float(tags['building:levels']) * 3
-            except:
-                height = 10
-        else:
-            height = 10
-
-        shadow_length = calculate_shadow_length(height, sun_altitude)
-        if shadow_length is None:
-            continue
-
-        shadow_direction = (sun_azimuth + 180) % 360
-
-        if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
-            in_shadow = True
-            shadow_building_id = b.get('id', 'невідомо')
-            break
-
-    if in_shadow:
-        await update.message.reply_text(
-            f"Ваша машина зараз у тіні від будівлі (ID: {shadow_building_id}).\n"
-            f"Тінь залежить від положення сонця і триватиме приблизно до заходу."
-        )
-    else:
-        city = LocationInfo(latitude=lat, longitude=lon)
-        s = sun(city.observer, date=now, tzinfo=timezone.utc)
-        sunset = s['sunset']
-        delta = sunset - now
-        minutes_to_shadow = int(delta.total_seconds() // 60) if delta.total_seconds() > 0 else 0
-        await update.message.reply_text(
-            f"Зараз ваша машина на сонці.\n"
-            f"Тінь з’явиться приблизно через {minutes_to_shadow} хвилин (після заходу сонця)."
-        )
+    schedule = analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
+    text = format_schedule_text(schedule)
+    await update.message.reply_text(text)
 
 if __name__ == '__main__':
     if not BOT_TOKEN:
