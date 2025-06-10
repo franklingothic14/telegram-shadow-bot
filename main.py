@@ -4,14 +4,20 @@ import requests
 from datetime import datetime, timezone, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from astral import LocationInfo
-from astral.sun import sun
-from astral import sun as astral_sun
 from astral import Observer
+from astral.sun import azimuth as sun_azimuth_func, elevation as sun_elevation_func
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 USE_WEATHER = os.getenv('USE_WEATHER', 'false').lower() == 'true'
+
+ORIENTATION_DEGREES = {
+    "Північ": 0,
+    "Схід": 90,
+    "Південь": 180,
+    "Захід": 270,
+    "Не знаю": None
+}
 
 def get_weather(lat, lon):
     if not OPENWEATHER_API_KEY:
@@ -66,8 +72,8 @@ def get_building_height(tags):
 
 def get_sun_position(lat, lon, date_time):
     observer = Observer(latitude=lat, longitude=lon, elevation=0)
-    azimuth = astral_sun.azimuth(observer, date_time)
-    altitude = astral_sun.elevation(observer, date_time)
+    azimuth = sun_azimuth_func(observer, date_time)
+    altitude = sun_elevation_func(observer, date_time)
     return azimuth, altitude
 
 def calculate_shadow_length(height, sun_altitude_deg):
@@ -100,14 +106,22 @@ def point_in_shadow(building_center_lat, building_center_lon, car_lat, car_lon, 
     azimuth_to_car = calculate_azimuth(building_center_lat, building_center_lon, car_lat, car_lon)
     dist = haversine_distance(building_center_lat, building_center_lon, car_lat, car_lon)
     angle_diff = min(abs(azimuth_to_car - shadow_direction), 360 - abs(azimuth_to_car - shadow_direction))
-    if dist <= shadow_length and angle_diff <= 30:
-        return True
-    return False
+    return dist <= shadow_length and angle_diff <= 30
+
+def get_sun_facing_side(car_azimuth, sun_azimuth):
+    angle_diff = (sun_azimuth - car_azimuth + 360) % 360
+    if 45 <= angle_diff < 135:
+        return "ліву сторону"
+    elif 135 <= angle_diff < 225:
+        return "задню частину"
+    elif 225 <= angle_diff < 315:
+        return "праву сторону"
+    else:
+        return "передню частину"
 
 def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     now = datetime.now(timezone.utc)
     end_time = now + timedelta(hours=24)
-
     schedule = []
     current_state = None
     state_start = now
@@ -116,7 +130,7 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     while time <= end_time:
         azimuth, altitude = get_sun_position(lat, lon, time)
         if altitude <= 0:
-            state = 'shade'  # ніч, тінь
+            state = 'тінь (ніч)'
         else:
             shadow_direction = (azimuth + 180) % 360
             in_shadow = False
@@ -134,7 +148,6 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
 
                 tags = b.get('tags', {})
                 height = get_building_height(tags)
-
                 shadow_length = calculate_shadow_length(height, altitude)
                 if shadow_length is None:
                     continue
@@ -142,8 +155,7 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
                 if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
                     in_shadow = True
                     break
-
-            state = 'shade' if in_shadow else 'sun'
+            state = 'тінь від будівель' if in_shadow else 'сонце'
 
         if current_state is None:
             current_state = state
@@ -158,27 +170,73 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     schedule.append((state_start, time, current_state))
     return schedule
 
+def analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15):
+    now = datetime.now(timezone.utc)
+    end_time = now + timedelta(hours=24)
+    schedule = []
+    current_side = None
+    state_start = now
+    time = now
+
+    while time <= end_time:
+        azimuth, altitude = get_sun_position(lat, lon, time)
+        if altitude <= 0:
+            side = "тінь (ніч)"
+        else:
+            shadow_direction = (azimuth + 180) % 360
+            in_shadow = False
+            for b in buildings:
+                if 'center' in b:
+                    b_lat = b['center']['lat']
+                    b_lon = b['center']['lon']
+                elif 'geometry' in b and len(b['geometry']) > 0:
+                    lats = [p['lat'] for p in b['geometry']]
+                    lons = [p['lon'] for p in b['geometry']]
+                    b_lat = sum(lats)/len(lats)
+                    b_lon = sum(lons)/len(lons)
+                else:
+                    continue
+
+                tags = b.get('tags', {})
+                height = get_building_height(tags)
+                shadow_length = calculate_shadow_length(height, altitude)
+                if shadow_length is None:
+                    continue
+
+                if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
+                    in_shadow = True
+                    break
+
+            if in_shadow:
+                side = "тінь від будівель"
+            else:
+                side = get_sun_facing_side(car_orientation, azimuth)
+
+        if current_side is None:
+            current_side = side
+            state_start = time
+        elif side != current_side:
+            schedule.append((state_start, time, current_side))
+            current_side = side
+            state_start = time
+
+        time += timedelta(minutes=interval_minutes)
+
+    schedule.append((state_start, time, current_side))
+    return schedule
+
 def format_schedule_text(schedule):
-    shade_periods = [p for p in schedule if p[2] == 'shade']
-    sun_periods = [p for p in schedule if p[2] == 'sun']
+    parts = {}
+    for start, end, state in schedule:
+        parts.setdefault(state, []).append((start, end))
 
-    total_shade = sum((p[1] - p[0]).total_seconds() for p in shade_periods) / 60
-    total_sun = sum((p[1] - p[0]).total_seconds() for p in sun_periods) / 60
-
-    def period_str(p):
-        start_str = p[0].astimezone().strftime('%H:%M')
-        end_str = p[1].astimezone().strftime('%H:%M')
-        duration_min = int((p[1] - p[0]).total_seconds() // 60)
-        return f"{duration_min}хв з {start_str} до {end_str}"
-
-    shade_texts = [period_str(p) for p in shade_periods]
-    sun_texts = [period_str(p) for p in sun_periods]
-
-    text = (f"Ваша машина буде в тіні {int(total_shade)} хв:\n" +
-            "\n".join(shade_texts) + "\n\n" +
-            f"Під сонцем буде {int(total_sun)} хв:\n" +
-            "\n".join(sun_texts))
-    return text
+    lines = []
+    for state, intervals in parts.items():
+        total_min = sum(int((e - s).total_seconds() // 60) for s, e in intervals)
+        lines.append(f"{state}: {total_min} хв")
+        for s, e in intervals:
+            lines.append(f"  з {s.astimezone().strftime('%H:%M')} до {e.astimezone().strftime('%H:%M')}")
+    return "\n".join(lines)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[KeyboardButton('Запаркувався - скинути локацію', request_location=True)]]
@@ -187,68 +245,70 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
     )
 
-async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loc = update.message.location
-    lat, lon = loc.latitude, loc.longitude
+async def ask_car_orientation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [KeyboardButton("Північ"), KeyboardButton("Схід")],
+        [KeyboardButton("Південь"), KeyboardButton("Захід")],
+        [KeyboardButton("Не знаю")]
+    ]
+    await update.message.reply_text(
+        "Вкажіть, в який бік орієнтована передня частина вашої машини або оберіть «Не знаю»:",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
 
-    if USE_WEATHER:
-        weather = get_weather(lat, lon)
-        if weather is None:
-            await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
-            return
-        if weather['is_rain']:
-            await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
-            return
-        if weather['is_cloudy']:
-            await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
+async def orientation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text not in ORIENTATION_DEGREES:
+        await update.message.reply_text("Будь ласка, оберіть напрямок із кнопок.")
+        return
+    orientation = ORIENTATION_DEGREES[text]
+    context.user_data['car_orientation'] = orientation
+    await update.message.reply_text(f"Орієнтація машини встановлена: {text}. Обробляю дані...")
+
+    if orientation is None:
+        # Спрощений аналіз без деталізації по сторонах
+        await analyze_and_report_shadow_simple(update, context)
+    else:
+        # Детальний аналіз із деталізацією по сторонах
+        await analyze_and_report_shadow(update, context)
+
+async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lat = update.message.location.latitude
+    lon = update.message.location.longitude
 
     buildings = get_nearby_buildings(lat, lon, radius=50)
     if not buildings:
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    count_buildings = len(buildings)
-    count_with_height = 0
-    count_with_levels = 0
-    for b in buildings:
-        tags = b.get('tags', {})
-        if 'height' in tags:
-            count_with_height += 1
-        if 'building:levels' in tags:
-            count_with_levels += 1
-
-    report_lines = [
-        f"Знайдено будівель поблизу: {count_buildings}",
-        f"З них з вказаною висотою: {count_with_height}",
-        f"З них з вказаною кількістю поверхів: {count_with_levels}"
-    ]
-    report_text = "\n".join(report_lines)
-    await update.message.reply_text(report_text)
-
-    for b in buildings:
-        b_lat = None
-        b_lon = None
-        if 'center' in b:
-            b_lat = b['center']['lat']
-            b_lon = b['center']['lon']
-        elif 'geometry' in b and len(b['geometry']) > 0:
-            lats = [p['lat'] for p in b['geometry']]
-            lons = [p['lon'] for p in b['geometry']]
-            b_lat = sum(lats)/len(lats)
-            b_lon = sum(lons)/len(lons)
-        else:
-            continue
-
-        dist = haversine_distance(lat, lon, b_lat, b_lon)
-        if dist < 3:
-            await update.message.reply_text(
-                f"Ваша машина знаходиться безпосередньо під будівлею (ID: {b.get('id', 'невідомо')}) — вона в тіні."
-            )
-            return
-
     schedule = analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
     text = format_schedule_text(schedule)
     await update.message.reply_text(text)
+
+async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lat = update.message.location.latitude
+    lon = update.message.location.longitude
+    car_orientation = context.user_data.get('car_orientation')
+    if car_orientation is None:
+        await update.message.reply_text("Помилка: не задано орієнтацію машини.")
+        return
+
+    buildings = get_nearby_buildings(lat, lon, radius=50)
+    if not buildings:
+        await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
+        return
+
+    schedule = analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15)
+    text = format_schedule_text(schedule)
+    await update.message.reply_text(text)
+
+async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.location is None:
+        await update.message.reply_text("Будь ласка, надішліть локацію.")
+        return
+    # Запитуємо орієнтацію машини після отримання локації
+    context.user_data['location'] = update.message.location
+    await ask_car_orientation(update, context)
 
 if __name__ == '__main__':
     if not BOT_TOKEN:
@@ -258,5 +318,6 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), orientation_handler))
     print("Бот запущено...")
     app.run_polling()
