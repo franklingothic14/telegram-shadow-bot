@@ -1,6 +1,5 @@
 import os
 import math
-import asyncio
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
@@ -20,10 +19,8 @@ ORIENTATION_DEGREES = {
     "Не знаю": None
 }
 
-# Прості кеші з часом життя 10 хв
 cache_overpass = {}
 cache_weather = {}
-
 CACHE_TTL = timedelta(minutes=10)
 
 async def fetch_overpass(lat, lon, radius=50):
@@ -95,7 +92,7 @@ def get_building_height(tags):
             return levels * 3
         except:
             pass
-    return 10  # За замовчуванням 10 метрів
+    return 10
 
 def get_sun_position(lat, lon, date_time):
     observer = Observer(latitude=lat, longitude=lon, elevation=0)
@@ -145,57 +142,6 @@ def get_sun_facing_side(car_azimuth, sun_azimuth):
         return "праву сторону"
     else:
         return "передню частину"
-
-async def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
-    now = datetime.now(timezone.utc)
-    end_time = now + timedelta(hours=24)
-    schedule = []
-    current_state = None
-    state_start = now
-    time = now
-
-    while time <= end_time:
-        azimuth, altitude = get_sun_position(lat, lon, time)
-        if altitude <= 0:
-            state = 'тінь (ніч)'
-        else:
-            shadow_direction = (azimuth + 180) % 360
-            in_shadow = False
-            for b in buildings:
-                if 'center' in b:
-                    b_lat = b['center']['lat']
-                    b_lon = b['center']['lon']
-                elif 'geometry' in b and len(b['geometry']) > 0:
-                    lats = [p['lat'] for p in b['geometry']]
-                    lons = [p['lon'] for p in b['geometry']]
-                    b_lat = sum(lats)/len(lats)
-                    b_lon = sum(lons)/len(lons)
-                else:
-                    continue
-
-                tags = b.get('tags', {})
-                height = get_building_height(tags)
-                shadow_length = calculate_shadow_length(height, altitude)
-                if shadow_length is None:
-                    continue
-
-                if point_in_shadow(b_lat, b_lon, lat, lon, shadow_length, shadow_direction):
-                    in_shadow = True
-                    break
-            state = 'тінь від будівель' if in_shadow else 'сонце'
-
-        if current_state is None:
-            current_state = state
-            state_start = time
-        elif state != current_state:
-            schedule.append((state_start, time, current_state))
-            current_state = state
-            state_start = time
-
-        time += timedelta(minutes=interval_minutes)
-
-    schedule.append((state_start, time, current_state))
-    return schedule
 
 async def analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15):
     now = datetime.now(timezone.utc)
@@ -252,18 +198,36 @@ async def analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation,
     schedule.append((state_start, time, current_side))
     return schedule
 
-def format_schedule_text(schedule):
-    parts = {}
+def format_schedule_text_with_sides(schedule):
+    sun_parts = {"передню частину": [], "ліву сторону": [], "праву сторону": [], "задню частину": []}
+    shade_periods = []
+
     for start, end, state in schedule:
-        parts.setdefault(state, []).append((start, end))
+        if state.startswith("тінь"):
+            shade_periods.append((start, end))
+        else:
+            sun_parts.setdefault(state, []).append((start, end))
 
     lines = []
-    for state, intervals in parts.items():
-        total_min = sum(int((e - s).total_seconds() // 60) for s, e in intervals)
-        lines.append(f"{state}: {total_min} хв")
+
+    # Тінь — виводимо один інтервал від мінімального початку до максимального кінця
+    if shade_periods:
+        shade_start = min(p[0] for p in shade_periods)
+        shade_end = max(p[1] for p in shade_periods)
+        shade_minutes = int(sum((e - s).total_seconds() for s, e in shade_periods) // 60)
+        lines.append(f"Ваша машина буде в тіні {shade_minutes} хв з {shade_start.astimezone().strftime('%H:%M')} до {shade_end.astimezone().strftime('%H:%M')}\n")
+
+    # Сонце — деталізовано по частинах машини
+    for side, intervals in sun_parts.items():
+        if not intervals:
+            continue
+        total_min = int(sum((e - s).total_seconds() for s, e in intervals) // 60)
+        lines.append(f"Під сонцем на {side} — {total_min} хв:")
         for s, e in intervals:
             lines.append(f"  з {s.astimezone().strftime('%H:%M')} до {e.astimezone().strftime('%H:%M')}")
-    return "\n".join(lines)
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[KeyboardButton('Запаркувався - скинути локацію', request_location=True)]]
@@ -358,7 +322,7 @@ async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes
             return
 
     schedule = await analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
-    text = format_schedule_text(schedule)
+    text = format_schedule_text_with_sides(schedule)
     await update.message.reply_text(text)
 
 async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,7 +390,7 @@ async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAUL
             return
 
     schedule = await analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15)
-    text = format_schedule_text(schedule)
+    text = format_schedule_text_with_sides(schedule)
     await update.message.reply_text(text)
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
