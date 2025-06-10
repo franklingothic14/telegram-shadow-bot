@@ -1,6 +1,7 @@
 import os
 import math
-import requests
+import asyncio
+import aiohttp
 from datetime import datetime, timezone, timedelta
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -19,29 +20,20 @@ ORIENTATION_DEGREES = {
     "Не знаю": None
 }
 
-def get_weather(lat, lon):
-    if not OPENWEATHER_API_KEY:
-        return None
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ua"
-    try:
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        description = data['weather'][0]['description']
-        clouds = data.get('clouds', {}).get('all', 0)
-        rain = data.get('rain', {})
-        snow = data.get('snow', {})
-        precip = rain.get('1h', 0) + snow.get('1h', 0)
-        is_rain = precip > 0
-        is_cloudy = clouds > 70
-        return {
-            'description': description,
-            'is_rain': is_rain,
-            'is_cloudy': is_cloudy
-        }
-    except Exception:
-        return None
+# Прості кеші з часом життя 10 хв
+cache_overpass = {}
+cache_weather = {}
 
-def get_nearby_buildings(lat, lon, radius=50):
+CACHE_TTL = timedelta(minutes=10)
+
+async def fetch_overpass(lat, lon, radius=50):
+    key = (round(lat, 4), round(lon, 4), radius)
+    now = datetime.now(timezone.utc)
+    if key in cache_overpass:
+        cached_time, data = cache_overpass[key]
+        if now - cached_time < CACHE_TTL:
+            return data
+
     query = f"""
     [out:json];
     (
@@ -50,9 +42,44 @@ def get_nearby_buildings(lat, lon, radius=50):
     );
     out center tags;
     """
-    response = requests.post("https://overpass-api.de/api/interpreter", data={'data': query})
-    data = response.json()
-    return data.get('elements', [])
+    url = "https://overpass-api.de/api/interpreter"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data={'data': query}) as resp:
+            data = await resp.json()
+            cache_overpass[key] = (now, data.get('elements', []))
+            return cache_overpass[key][1]
+
+async def fetch_weather(lat, lon):
+    if not OPENWEATHER_API_KEY:
+        return None
+    key = (round(lat, 4), round(lon, 4))
+    now = datetime.now(timezone.utc)
+    if key in cache_weather:
+        cached_time, data = cache_weather[key]
+        if now - cached_time < CACHE_TTL:
+            return data
+
+    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ua"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=5) as resp:
+                data = await resp.json()
+                description = data['weather'][0]['description']
+                clouds = data.get('clouds', {}).get('all', 0)
+                rain = data.get('rain', {})
+                snow = data.get('snow', {})
+                precip = rain.get('1h', 0) + snow.get('1h', 0)
+                is_rain = precip > 0
+                is_cloudy = clouds > 70
+                result = {
+                    'description': description,
+                    'is_rain': is_rain,
+                    'is_cloudy': is_cloudy
+                }
+                cache_weather[key] = (now, result)
+                return result
+        except Exception:
+            return None
 
 def get_building_height(tags):
     if 'height' in tags:
@@ -119,7 +146,7 @@ def get_sun_facing_side(car_azimuth, sun_azimuth):
     else:
         return "передню частину"
 
-def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
+async def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     now = datetime.now(timezone.utc)
     end_time = now + timedelta(hours=24)
     schedule = []
@@ -170,7 +197,7 @@ def analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15):
     schedule.append((state_start, time, current_state))
     return schedule
 
-def analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15):
+async def analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15):
     now = datetime.now(timezone.utc)
     end_time = now + timedelta(hours=24)
     schedule = []
@@ -266,39 +293,139 @@ async def orientation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"Орієнтація машини встановлена: {text}. Обробляю дані...")
 
     if orientation is None:
-        # Спрощений аналіз без деталізації по сторонах
         await analyze_and_report_shadow_simple(update, context)
     else:
-        # Детальний аналіз із деталізацією по сторонах
         await analyze_and_report_shadow(update, context)
 
 async def analyze_and_report_shadow_simple(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lat = update.message.location.latitude
-    lon = update.message.location.longitude
+    loc = context.user_data.get('location') or update.message.location
+    lat = loc.latitude
+    lon = loc.longitude
 
-    buildings = get_nearby_buildings(lat, lon, radius=50)
+    if USE_WEATHER:
+        weather = await fetch_weather(lat, lon)
+        if weather is None:
+            await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
+            return
+        if weather['is_rain']:
+            await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
+            return
+        if weather['is_cloudy']:
+            await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
+
+    buildings = await fetch_overpass(lat, lon, radius=50)
     if not buildings:
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    schedule = analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
+    count_buildings = len(buildings)
+    count_with_height = 0
+    count_with_levels = 0
+    for b in buildings:
+        tags = b.get('tags', {})
+        if 'height' in tags:
+            count_with_height += 1
+        if 'building:levels' in tags:
+            count_with_levels += 1
+
+    report_lines = [
+        f"Знайдено будівель поблизу: {count_buildings}",
+        f"З них з вказаною висотою: {count_with_height}",
+        f"З них з вказаною кількістю поверхів: {count_with_levels}"
+    ]
+    await update.message.reply_text("\n".join(report_lines))
+
+    # Перевірка, чи машина під будівлею (відстань < 3м)
+    for b in buildings:
+        b_lat = None
+        b_lon = None
+        if 'center' in b:
+            b_lat = b['center']['lat']
+            b_lon = b['center']['lon']
+        elif 'geometry' in b and len(b['geometry']) > 0:
+            lats = [p['lat'] for p in b['geometry']]
+            lons = [p['lon'] for p in b['geometry']]
+            b_lat = sum(lats)/len(lats)
+            b_lon = sum(lons)/len(lons)
+        else:
+            continue
+
+        dist = haversine_distance(lat, lon, b_lat, b_lon)
+        if dist < 3:
+            await update.message.reply_text(
+                f"Ваша машина знаходиться безпосередньо під будівлею (ID: {b.get('id', 'невідомо')}) — вона в тіні."
+            )
+            return
+
+    schedule = await analyze_shadow_schedule(lat, lon, buildings, interval_minutes=15)
     text = format_schedule_text(schedule)
     await update.message.reply_text(text)
 
 async def analyze_and_report_shadow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lat = update.message.location.latitude
-    lon = update.message.location.longitude
+    loc = context.user_data.get('location') or update.message.location
+    lat = loc.latitude
+    lon = loc.longitude
     car_orientation = context.user_data.get('car_orientation')
     if car_orientation is None:
         await update.message.reply_text("Помилка: не задано орієнтацію машини.")
         return
 
-    buildings = get_nearby_buildings(lat, lon, radius=50)
+    if USE_WEATHER:
+        weather = await fetch_weather(lat, lon)
+        if weather is None:
+            await update.message.reply_text("Не вдалося отримати інформацію про погоду.")
+            return
+        if weather['is_rain']:
+            await update.message.reply_text(f"Зараз йде опад ({weather['description']}). Тінь від сонця відсутня.")
+            return
+        if weather['is_cloudy']:
+            await update.message.reply_text(f"Зараз хмарно ({weather['description']}). Сонячна тінь може бути слабкою або відсутньою.")
+
+    buildings = await fetch_overpass(lat, lon, radius=50)
     if not buildings:
         await update.message.reply_text("Не вдалося знайти будівлі поблизу для аналізу тіні.")
         return
 
-    schedule = analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15)
+    count_buildings = len(buildings)
+    count_with_height = 0
+    count_with_levels = 0
+    for b in buildings:
+        tags = b.get('tags', {})
+        if 'height' in tags:
+            count_with_height += 1
+        if 'building:levels' in tags:
+            count_with_levels += 1
+
+    report_lines = [
+        f"Знайдено будівель поблизу: {count_buildings}",
+        f"З них з вказаною висотою: {count_with_height}",
+        f"З них з вказаною кількістю поверхів: {count_with_levels}"
+    ]
+    await update.message.reply_text("\n".join(report_lines))
+
+    # Перевірка, чи машина під будівлею (відстань < 3м)
+    for b in buildings:
+        b_lat = None
+        b_lon = None
+        if 'center' in b:
+            b_lat = b['center']['lat']
+            b_lon = b['center']['lon']
+        elif 'geometry' in b and len(b['geometry']) > 0:
+            lats = [p['lat'] for p in b['geometry']]
+            lons = [p['lon'] for p in b['geometry']]
+            b_lat = sum(lats)/len(lats)
+            b_lon = sum(lons)/len(lons)
+        else:
+            continue
+
+        dist = haversine_distance(lat, lon, b_lat, b_lon)
+        if dist < 3:
+            await update.message.reply_text(
+                f"Ваша машина знаходиться безпосередньо під будівлею (ID: {b.get('id', 'невідомо')}) — вона в тіні."
+            )
+            return
+
+    schedule = await analyze_shadow_schedule_detailed(lat, lon, buildings, car_orientation, interval_minutes=15)
     text = format_schedule_text(schedule)
     await update.message.reply_text(text)
 
@@ -306,18 +433,19 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.location is None:
         await update.message.reply_text("Будь ласка, надішліть локацію.")
         return
-    # Запитуємо орієнтацію машини після отримання локації
     context.user_data['location'] = update.message.location
     await ask_car_orientation(update, context)
 
-if __name__ == '__main__':
-    if not BOT_TOKEN:
-        print("Помилка: не задано BOT_TOKEN")
-        exit(1)
-
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), orientation_handler))
     print("Бот запущено...")
     app.run_polling()
+
+if __name__ == '__main__':
+    if not BOT_TOKEN:
+        print("Помилка: не задано BOT_TOKEN")
+        exit(1)
+    main()
