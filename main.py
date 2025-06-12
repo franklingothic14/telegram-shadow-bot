@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime, timedelta
 
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ChatAction
@@ -12,7 +11,7 @@ from timezonefinder import TimezoneFinder
 from pytz import timezone
 
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 
 def get_main_keyboard():
@@ -24,10 +23,6 @@ def get_main_keyboard():
 
 
 def simulate_sun_angle(hour_decimal: float) -> float:
-    """
-    Просте моделювання висоти сонця:
-    максимальна о 13:00, мінімальна зранку та ввечері.
-    """
     return max(0, 90 - abs(hour_decimal - 13) * 7)
 
 
@@ -43,24 +38,20 @@ def get_shadow_data(local_time: datetime) -> tuple[list[str], str]:
         hour_decimal = current_time.hour + current_time.minute / 60
         sun_angle = simulate_sun_angle(hour_decimal)
 
-        shadow = sun_angle < 45  # тінь якщо сонце низько
+        shadow = sun_angle < 45
 
         if i % 12 == 0:
             bar += "🌑" if shadow else "☀️"
 
-        if shadow:
-            if not in_shadow:
-                start_time = current_time
-                in_shadow = True
-        else:
-            if in_shadow:
-                end_time = current_time
-                intervals.append(f"{start_time.strftime('%H:%M')} – {end_time.strftime('%H:%M')}")
-                in_shadow = False
+        if shadow and not in_shadow:
+            start_time = current_time
+            in_shadow = True
+        elif not shadow and in_shadow:
+            intervals.append(f"{start_time.strftime('%H:%M')} – {current_time.strftime('%H:%M')}")
+            in_shadow = False
 
     if in_shadow and start_time:
-        end_time = current_time
-        intervals.append(f"{start_time.strftime('%H:%M')} – {end_time.strftime('%H:%M')}")
+        intervals.append(f"{start_time.strftime('%H:%M')} – {current_time.strftime('%H:%M')}")
 
     return intervals, bar
 
@@ -74,6 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
     loc = update.message.location
     if not loc:
         await update.message.reply_text("❌ Будь ласка, надішліть локацію через кнопку.")
