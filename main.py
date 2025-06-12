@@ -1,122 +1,71 @@
-import os
-import aiohttp
-from datetime import datetime
-import pytz
+from astral import LocationInfo
+from astral.sun import sun, azimuth
 from timezonefinder import TimezoneFinder
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from datetime import datetime, timedelta
+from math import atan2, degrees
+import pytz
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📍 Надіслати локацію", request_location=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-def get_local_time(lat: float, lon: float) -> datetime:
-    tf = TimezoneFinder()
-    timezone_str = tf.timezone_at(lat=lat, lng=lon)
-    if timezone_str is None:
-        timezone_str = "UTC"
-    tz = pytz.timezone(timezone_str)
-    return datetime.now(tz)
-
-async def fetch_nearby_objects(lat: float, lon: float) -> list:
-    query = f"""
-    [out:json][timeout:10];
-    (
-      way(around:50,{lat},{lon})["building"];
-      node(around:50,{lat},{lon})["natural"="tree"];
-      way(around:50,{lat},{lon})["landuse"="forest"];
-    );
-    out body;
+def check_shadow(lat, lon, sun_azimuth, nearby_objects):
     """
-    url = "https://overpass-api.de/api/interpreter"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data={"data": query}) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    return result.get("elements", [])
-    except Exception as e:
-        print(f"Error fetching Overpass data: {e}")
-    return []
+    Перевіряє, чи буде тінь від об'єктів поблизу в напрямку сонця.
+    """
+    for obj in nearby_objects:
+        dx = obj['lon'] - lon
+        dy = obj['lat'] - lat
+        if dx == 0 and dy == 0:
+            continue
 
-def estimate_shadow_presence(objects: list) -> bool:
-    for obj in objects:
-        tags = obj.get("tags", {})
-        if "building" in tags:
-            return True
-        if tags.get("natural") == "tree" or tags.get("landuse") == "forest":
+        angle = (degrees(atan2(dx, dy)) + 360) % 360
+        dist = ((dx)**2 + (dy)**2)**0.5 * 111000  # прибл. у метрах
+        angle_diff = abs((angle - sun_azimuth + 180) % 360 - 180)
+
+        if dist < 25 and angle_diff < 20 and obj['type'] in ['building', 'tree']:
             return True
     return False
 
-def summarize_object_types(objects: list) -> str:
-    summary = {"building": 0, "tree": 0, "forest": 0}
-    for obj in objects:
-        tags = obj.get("tags", {})
-        if "building" in tags:
-            summary["building"] += 1
-        elif tags.get("natural") == "tree":
-            summary["tree"] += 1
-        elif tags.get("landuse") == "forest":
-            summary["forest"] += 1
 
-    parts = []
-    if summary["building"]:
-        parts.append(f"🏢 Будівлі: {summary['building']}")
-    if summary["tree"]:
-        parts.append(f"🌳 Дерева: {summary['tree']}")
-    if summary["forest"]:
-        parts.append(f"🌲 Ліс: {summary['forest']}")
+def generate_sun_shadow_slots(lat: float, lon: float, nearby_objects: list):
+    """
+    Повертає список таймслотів з іконкою сонце/тінь на основі геолокації та об'єктів поруч.
+    """
+    # Визначення часового поясу
+    tf = TimezoneFinder()
+    timezone_str = tf.timezone_at(lat=lat, lng=lon) or "UTC"
+    tz = pytz.timezone(timezone_str)
 
-    return "\n".join(parts) if parts else "🚫 Нічого не знайдено"
+    # Параметри локації
+    location = LocationInfo(latitude=lat, longitude=lon)
+    observer = location.observer
+    today = datetime.now(tz).date()
+    s = sun(observer, date=today, tzinfo=tz)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚗 Привіт! Надішліть локацію авто для аналізу тіні.",
-        reply_markup=get_main_keyboard()
-    )
+    start_time = s['sunrise'] - timedelta(minutes=30)
+    end_time = s['sunset'] + timedelta(minutes=30)
 
-async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loc = update.message.location
-    if not loc:
-        await update.message.reply_text("❌ Надішліть локацію через кнопку.")
-        return
+    # Генерація таймслотів
+    slots = []
+    dt = start_time
+    while dt <= end_time:
+        az = azimuth(observer, dt)
+        in_shadow = check_shadow(lat, lon, az, nearby_objects)
+        label = "🌑 Тінь" if in_shadow else "☀️ Сонце"
+        slot = f"{label} {dt.strftime('%H:%M')} — {(dt + timedelta(minutes=15)).strftime('%H:%M')}"
+        slots.append(slot)
+        dt += timedelta(minutes=15)
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    return "\n".join(slots)
 
-    try:
-        local_time = get_local_time(loc.latitude, loc.longitude)
-        nearby_objects = await fetch_nearby_objects(loc.latitude, loc.longitude)
-        is_shadow = estimate_shadow_presence(nearby_objects)
-        summary = summarize_object_types(nearby_objects)
 
-        result = "✅ Ймовірно, в тіні." if is_shadow else "☀️ Ймовірно, на сонці."
-
-        await update.message.reply_text(
-            f"{result}\n\n"
-            f"🕒 Локальний час: {local_time.strftime('%H:%M')}\n"
-            f"📍 Об’єкти поруч:\n{summary}"
-        )
-    except Exception as e:
-        print(f"Error: {e}")
-        await update.message.reply_text("⚠️ Помилка. Спробуйте пізніше.")
-
-def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN не встановлений!")
-        return
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
-
-    print("🤖 Бот активовано!")
-    app.run_polling()
-
+# === 🔍 ПРИКЛАД ВИКОРИСТАННЯ ===
 if __name__ == "__main__":
-    main()
+    latitude = 50.4501
+    longitude = 30.5234  # Київ
+
+    # Умовні об'єкти поблизу
+    nearby_objects = [
+        {'type': 'building', 'lat': 50.4504, 'lon': 30.5236},
+        {'type': 'tree', 'lat': 50.4499, 'lon': 30.5231}
+    ]
+
+    print(generate_sun_shadow_slots(latitude, longitude, nearby_objects))
