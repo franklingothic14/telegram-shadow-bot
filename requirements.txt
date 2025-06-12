@@ -1,4 +1,6 @@
-python-telegram-bot>=20.0
+python-telegram-bot==20.6
 aiohttp
-pytz
+shapely
+geopandas
 timezonefinder
+pytz
