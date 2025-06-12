@@ -1,18 +1,13 @@
 import os
-from datetime import datetime, timedelta
-
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ChatAction
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
-
+import aiohttp
+from datetime import datetime
+import pytz
 from timezonefinder import TimezoneFinder
-from pytz import timezone
-
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
@@ -21,92 +16,107 @@ def get_main_keyboard():
         one_time_keyboard=True
     )
 
+def get_local_time(lat: float, lon: float) -> datetime:
+    tf = TimezoneFinder()
+    timezone_str = tf.timezone_at(lat=lat, lng=lon)
+    if timezone_str is None:
+        timezone_str = "UTC"
+    tz = pytz.timezone(timezone_str)
+    return datetime.now(tz)
 
-def simulate_sun_angle(hour_decimal: float) -> float:
-    return max(0, 90 - abs(hour_decimal - 13) * 7)
+async def fetch_nearby_objects(lat: float, lon: float) -> list:
+    query = f"""
+    [out:json][timeout:10];
+    (
+      way(around:50,{lat},{lon})["building"];
+      node(around:50,{lat},{lon})["natural"="tree"];
+      way(around:50,{lat},{lon})["landuse"="forest"];
+    );
+    out body;
+    """
+    url = "https://overpass-api.de/api/interpreter"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={"data": query}) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return result.get("elements", [])
+    except Exception as e:
+        print(f"Error fetching Overpass data: {e}")
+    return []
 
+def estimate_shadow_presence(objects: list) -> bool:
+    for obj in objects:
+        tags = obj.get("tags", {})
+        if "building" in tags:
+            return True
+        if tags.get("natural") == "tree" or tags.get("landuse") == "forest":
+            return True
+    return False
 
-def get_shadow_data(local_time: datetime) -> tuple[list[str], str]:
-    intervals = []
-    bar = ""
-    in_shadow = False
-    start_time = None
+def summarize_object_types(objects: list) -> str:
+    summary = {"building": 0, "tree": 0, "forest": 0}
+    for obj in objects:
+        tags = obj.get("tags", {})
+        if "building" in tags:
+            summary["building"] += 1
+        elif tags.get("natural") == "tree":
+            summary["tree"] += 1
+        elif tags.get("landuse") == "forest":
+            summary["forest"] += 1
 
-    for i in range(288):  # 24 години по 5 хв = 288 таймслотів
-        minutes_offset = i * 5
-        current_time = local_time.replace(second=0, microsecond=0) + timedelta(minutes=minutes_offset)
-        hour_decimal = current_time.hour + current_time.minute / 60
-        sun_angle = simulate_sun_angle(hour_decimal)
+    parts = []
+    if summary["building"]:
+        parts.append(f"🏢 Будівлі: {summary['building']}")
+    if summary["tree"]:
+        parts.append(f"🌳 Дерева: {summary['tree']}")
+    if summary["forest"]:
+        parts.append(f"🌲 Ліс: {summary['forest']}")
 
-        shadow = sun_angle < 45
-
-        if i % 12 == 0:
-            bar += "🌑" if shadow else "☀️"
-
-        if shadow and not in_shadow:
-            start_time = current_time
-            in_shadow = True
-        elif not shadow and in_shadow:
-            intervals.append(f"{start_time.strftime('%H:%M')} – {current_time.strftime('%H:%M')}")
-            in_shadow = False
-
-    if in_shadow and start_time:
-        intervals.append(f"{start_time.strftime('%H:%M')} – {current_time.strftime('%H:%M')}")
-
-    return intervals, bar
-
+    return "\n".join(parts) if parts else "🚫 Нічого не знайдено"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚗 Вітаю! Надішліть локацію авто, щоб дізнатися прогноз тіні.",
+        "🚗 Привіт! Надішліть локацію авто для аналізу тіні.",
         reply_markup=get_main_keyboard()
     )
 
-
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
     loc = update.message.location
     if not loc:
-        await update.message.reply_text("❌ Будь ласка, надішліть локацію через кнопку.")
+        await update.message.reply_text("❌ Надішліть локацію через кнопку.")
         return
 
-    try:
-        tf = TimezoneFinder()
-        tz_name = tf.timezone_at(lat=loc.latitude, lng=loc.longitude)
-        if not tz_name:
-            raise ValueError("Не вдалося визначити часовий пояс.")
-        local_time = datetime.now(timezone(tz_name))
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-        intervals, bar = get_shadow_data(local_time)
-        shadow_text = (
-            "🕶️ Час у тіні:\n" + "\n".join(intervals)
-            if intervals else "☀️ Ймовірно, весь день буде без тіні."
-        )
+    try:
+        local_time = get_local_time(loc.latitude, loc.longitude)
+        nearby_objects = await fetch_nearby_objects(loc.latitude, loc.longitude)
+        is_shadow = estimate_shadow_presence(nearby_objects)
+        summary = summarize_object_types(nearby_objects)
+
+        result = "✅ Ймовірно, в тіні." if is_shadow else "☀️ Ймовірно, на сонці."
 
         await update.message.reply_text(
-            f"🕒 Локальний час: {local_time.strftime('%H:%M')}\n\n"
-            f"{shadow_text}\n\n"
-            f"📊 Графік тіні:\n{bar}"
+            f"{result}\n\n"
+            f"🕒 Локальний час: {local_time.strftime('%H:%M')}\n"
+            f"📍 Об’єкти поруч:\n{summary}"
         )
-
     except Exception as e:
         print(f"Error: {e}")
-        await update.message.reply_text("❗ Сталася помилка. Спробуйте пізніше.")
-
+        await update.message.reply_text("⚠️ Помилка. Спробуйте пізніше.")
 
 def main():
     if not BOT_TOKEN:
-        print("❌ Помилка: BOT_TOKEN не вказаний у змінних середовища")
+        print("❌ BOT_TOKEN не встановлений!")
         return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
-    print("🤖 Бот активовано")
+    print("🤖 Бот активовано!")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
