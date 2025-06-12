@@ -3,10 +3,11 @@ import aiohttp
 from datetime import datetime
 import pytz
 from timezonefinder import TimezoneFinder
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
@@ -22,10 +23,6 @@ def get_local_time(lat: float, lon: float) -> datetime:
         timezone_str = "UTC"
     tz = pytz.timezone(timezone_str)
     return datetime.now(tz)
-
-def is_shadow_time(local_time: datetime) -> bool:
-    hour = local_time.hour
-    return hour < 9 or hour > 17  # враховуємо ранній ранок та вечір як потенційно тіньові періоди
 
 async def fetch_nearby_objects(lat: float, lon: float) -> list:
     query = f"""
@@ -44,21 +41,17 @@ async def fetch_nearby_objects(lat: float, lon: float) -> list:
                 if resp.status == 200:
                     result = await resp.json()
                     return result.get("elements", [])
-                else:
-                    print(f"Overpass error {resp.status}")
     except Exception as e:
-        print(f"Overpass exception: {e}")
+        print(f"Error fetching Overpass data: {e}")
     return []
 
 def estimate_shadow_presence(objects: list) -> bool:
     for obj in objects:
         tags = obj.get("tags", {})
         if "building" in tags:
-            height = float(tags.get("height", 15))  # за замовчуванням 15 м
-            if height >= 10:
-                return True
+            return True
         if tags.get("natural") == "tree" or tags.get("landuse") == "forest":
-            return True  # дерева/ліс — теж джерело тіні
+            return True
     return False
 
 def summarize_object_types(objects: list) -> str:
@@ -84,51 +77,45 @@ def summarize_object_types(objects: list) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚗 Вітаю! Надішліть локацію авто, щоб приблизно визначити, чи воно в тіні.",
+        "🚗 Привіт! Надішліть локацію авто для аналізу тіні.",
         reply_markup=get_main_keyboard()
     )
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     if not loc:
-        await update.message.reply_text("❌ Будь ласка, надішліть локацію через кнопку.")
+        await update.message.reply_text("❌ Надішліть локацію через кнопку.")
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
         local_time = get_local_time(loc.latitude, loc.longitude)
-        time_based_shadow = is_shadow_time(local_time)
-
         nearby_objects = await fetch_nearby_objects(loc.latitude, loc.longitude)
-        has_buildings_or_trees = estimate_shadow_presence(nearby_objects)
-        object_summary = summarize_object_types(nearby_objects)
+        is_shadow = estimate_shadow_presence(nearby_objects)
+        summary = summarize_object_types(nearby_objects)
 
-        if has_buildings_or_trees or time_based_shadow:
-            result = "🌳 Авто, ймовірно, в тіні (є об’єкти поруч або це не сонячні години)."
-        else:
-            result = "☀️ Авто, ймовірно, на сонці (нема будівель/дерев поруч і це день)."
+        result = "✅ Ймовірно, в тіні." if is_shadow else "☀️ Ймовірно, на сонці."
 
         await update.message.reply_text(
             f"{result}\n\n"
-            f"🕒 Локальний час: {local_time.strftime('%H:%M')}\n\n"
-            f"📍 Об’єкти поруч:\n{object_summary}"
+            f"🕒 Локальний час: {local_time.strftime('%H:%M')}\n"
+            f"📍 Об’єкти поруч:\n{summary}"
         )
-
     except Exception as e:
         print(f"Error: {e}")
-        await update.message.reply_text("❗ Сталася помилка. Спробуйте пізніше.")
+        await update.message.reply_text("⚠️ Помилка. Спробуйте пізніше.")
 
 def main():
     if not BOT_TOKEN:
-        print("❌ Помилка: Відсутній BOT_TOKEN")
+        print("❌ BOT_TOKEN не встановлений!")
         return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
-    print("🤖 Бот активовано")
+    print("🤖 Бот активовано!")
     app.run_polling()
 
 if __name__ == "__main__":
